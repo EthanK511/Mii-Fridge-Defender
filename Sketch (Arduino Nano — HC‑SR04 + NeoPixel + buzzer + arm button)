@@ -1,0 +1,196 @@
+// Mii Fridge Defender — Alarm Edition (Arduino Nano)
+// Hardware:
+//  - HC-SR04: Trig -> D2, Echo -> D3
+//  - NeoPixel (WS2812): DIN -> D6, +5V, GND
+//  - Buzzer (passive): + -> D9, - -> GND
+//  - Button (arm/disarm): D4 -> Button -> GND (INPUT_PULLUP)
+//  - Built-in LED: 13 (status)
+
+#include <Adafruit_NeoPixel.h>
+
+#define TRIG_PIN 2
+#define ECHO_PIN 3
+#define NEOPIXEL_PIN 6
+#define BUZZER_PIN 9
+#define BUTTON_PIN 4
+#define STATUS_LED_PIN 13
+
+#define NUM_PIXELS 1           // change if you have a strip
+#define DIST_THRESHOLD_CM 20   // trigger when object closer than this (cm)
+#define READ_INTERVAL_MS 120   // how often to check distance
+#define TRIGGER_COOLDOWN_MS 5000 // don't retrigger more often than this
+
+Adafruit_NeoPixel strip(NUM_PIXELS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+
+unsigned long lastRead = 0;
+unsigned long lastTrigger = 0;
+bool armed = true;
+bool muted = false;
+
+// button debounce
+unsigned long lastButtonChange = 0;
+bool lastButtonState = HIGH; // using INPUT_PULLUP
+const unsigned long DEBOUNCE_MS = 50;
+const unsigned long LONG_PRESS_MS = 1000;
+unsigned long buttonPressStart = 0;
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(STATUS_LED_PIN, OUTPUT);
+
+  strip.begin();
+  strip.show();
+  setArmedVisual();
+
+  Serial.println(F("Mii Fridge Defender — Nano (HC-SR04)"));
+  Serial.print(F("Distance threshold (cm): ")); Serial.println(DIST_THRESHOLD_CM);
+}
+
+void loop() {
+  handleButton();
+
+  unsigned long now = millis();
+  if (now - lastRead >= READ_INTERVAL_MS) {
+    lastRead = now;
+    float d = readDistanceCM(); // blocking but quick
+    // Serial print for debugging
+    // Serial.print("Distance: "); Serial.print(d); Serial.println(" cm");
+    if (armed && !muted && d > 0 && d <= DIST_THRESHOLD_CM && (now - lastTrigger >= TRIGGER_COOLDOWN_MS)) {
+      lastTrigger = now;
+      triggerAlarm();
+    }
+  }
+
+  // small idle LED blinking when armed
+  static unsigned long blinkT = 0;
+  if (armed) {
+    if (millis() - blinkT > 800) {
+      digitalWrite(STATUS_LED_PIN, !digitalRead(STATUS_LED_PIN));
+      blinkT = millis();
+    }
+  } else {
+    digitalWrite(STATUS_LED_PIN, LOW);
+  }
+}
+
+float readDistanceCM() {
+  // HC-SR04 pulseIn approach
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, 30000UL); // timeout 30 ms (max ~5m)
+  if (duration == 0) return -1.0; // no echo
+  float distanceCm = (duration / 2.0) * 0.0343; // speed of sound ~343 m/s
+  return distanceCm;
+}
+
+void triggerAlarm() {
+  Serial.print(F("Triggered at "));
+  Serial.println(millis());
+  // Visual: bright flash
+  flashPixels(3, 200);
+
+  // Sound: short melody
+  playAlertTone();
+
+  // Show a softer steady animation for a bit
+  showArmedPulse(2000);
+}
+
+void flashPixels(int times, int msPerFlash) {
+  for (int t = 0; t < times; t++) {
+    strip.fill(strip.Color(255, 0, 0), 0, NUM_PIXELS); // red
+    strip.show();
+    delay(msPerFlash);
+    strip.clear();
+    strip.show();
+    delay(80);
+  }
+}
+
+void playAlertTone() {
+  // simple sequence; adjust or replace with audio module for real voice
+  tone(BUZZER_PIN, 1000, 200);
+  delay(250);
+  tone(BUZZER_PIN, 1500, 120);
+  delay(150);
+  tone(BUZZER_PIN, 2000, 80);
+  delay(120);
+  noTone(BUZZER_PIN);
+}
+
+void showArmedPulse(unsigned long durationMs) {
+  unsigned long end = millis() + durationMs;
+  while (millis() < end) {
+    // pulse brightness from low to high
+    for (int b = 20; b <= 150; b += 10) {
+      strip.fill(strip.Color(b, 0, 0));
+      strip.setBrightness(b);
+      strip.show();
+      delay(20);
+    }
+    for (int b = 150; b >= 20; b -= 10) {
+      strip.fill(strip.Color(b, 0, 0));
+      strip.setBrightness(b);
+      strip.show();
+      delay(20);
+    }
+    if (!armed) break;
+  }
+  setArmedVisual();
+}
+
+void setArmedVisual() {
+  if (armed) {
+    strip.fill(strip.Color(0, 50, 0)); // dim green while armed
+  } else {
+    strip.fill(strip.Color(0, 0, 50)); // dim blue when disarmed
+  }
+  strip.show();
+}
+
+void handleButton() {
+  bool raw = digitalRead(BUTTON_PIN); // HIGH when not pressed, LOW when pressed
+  if (raw != lastButtonState) {
+    lastButtonChange = millis();
+    lastButtonState = raw;
+  }
+  if (millis() - lastButtonChange > DEBOUNCE_MS) {
+    // stable state
+    static bool lastStable = HIGH;
+    if (raw == LOW && lastStable == HIGH) {
+      // button just pressed
+      buttonPressStart = millis();
+    } else if (raw == HIGH && lastStable == LOW) {
+      // button just released
+      unsigned long pressLen = millis() - buttonPressStart;
+      if (pressLen >= LONG_PRESS_MS) {
+        // long press -> toggle mute
+        muted = !muted;
+        Serial.print("Muted: "); Serial.println(muted ? "YES" : "NO");
+        // short visual cue
+        if (muted) {
+          strip.fill(strip.Color(50,50,0)); // yellow
+        } else {
+          strip.fill(strip.Color(0,50,0)); // green
+        }
+        strip.show();
+        delay(400);
+        setArmedVisual();
+      } else {
+        // short press -> toggle armed
+        armed = !armed;
+        Serial.print("Armed: "); Serial.println(armed ? "YES" : "NO");
+        setArmedVisual();
+      }
+    }
+    lastStable = raw;
+  }
+}
